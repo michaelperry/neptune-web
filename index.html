@@ -1,0 +1,450 @@
+// Spot Report — Public HTML surf report page
+// Deploy via Supabase Dashboard (standalone, no shared imports)
+// URL: /functions/v1/spot-report?slug=miramar
+// JWT verification: DISABLED (public endpoint)
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabaseAdmin = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+// ========================
+// Utility functions
+// ========================
+
+function metersToFeet(m: number): number {
+  return Math.round(m * 3.28084 * 10) / 10;
+}
+function mpsToMph(mps: number): number {
+  return Math.round(mps * 2.23694 * 10) / 10;
+}
+function celsiusToFahrenheit(c: number): number {
+  return Math.round((c * 9) / 5 + 32);
+}
+function degreesToCardinal(degrees: number): string {
+  const dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+  return dirs[Math.round(degrees / 22.5) % 16];
+}
+function formatNOAADate(date: Date): string {
+  return `${date.getFullYear()}${String(date.getMonth()+1).padStart(2,"0")}${String(date.getDate()).padStart(2,"0")}`;
+}
+function escapeHtml(s: string): string {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+function v(val: number | null | undefined, unit = "", fallback = "—"): string {
+  if (val == null) return fallback;
+  return `${val}${unit}`;
+}
+
+// ========================
+// Condition fetchers (inlined from _shared)
+// ========================
+
+interface Conditions {
+  swellHeightFt: number | null;
+  swellPeriodS: number | null;
+  swellDirection: string | null;
+  windSpeedMph: number | null;
+  windDirection: string | null;
+  windGustsMph: number | null;
+  tideHeightFt: number | null;
+  tideType: string | null;
+  nextHighTide: string | null;
+  nextLowTide: string | null;
+  airTempF: number | null;
+  waterTempF: number | null;
+  uvIndex: number | null;
+  sunrise: string | null;
+  sunset: string | null;
+}
+
+async function fetchMarine(lat: number, lon: number): Promise<Partial<Conditions>> {
+  try {
+    const url = `https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=wave_height,wave_period,wave_direction&timezone=America/Los_Angeles`;
+    const res = await fetch(url);
+    if (!res.ok) return {};
+    const data = await res.json();
+    const c = data.current;
+    return {
+      swellHeightFt: c?.wave_height ? metersToFeet(c.wave_height) : null,
+      swellPeriodS: c?.wave_period ?? null,
+      swellDirection: c?.wave_direction ? degreesToCardinal(c.wave_direction) : null,
+    };
+  } catch { return {}; }
+}
+
+async function fetchWeather(lat: number, lon: number): Promise<Partial<Conditions>> {
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,uv_index&daily=sunrise,sunset&timezone=America/Los_Angeles&temperature_unit=fahrenheit&wind_speed_unit=mph`;
+    const res = await fetch(url);
+    if (!res.ok) return {};
+    const data = await res.json();
+    const c = data.current;
+    const d = data.daily;
+    return {
+      airTempF: c?.temperature_2m ?? null,
+      windSpeedMph: c?.wind_speed_10m ?? null,
+      windDirection: c?.wind_direction_10m ? degreesToCardinal(c.wind_direction_10m) : null,
+      windGustsMph: c?.wind_gusts_10m ?? null,
+      uvIndex: c?.uv_index ?? null,
+      sunrise: d?.sunrise?.[0] ?? null,
+      sunset: d?.sunset?.[0] ?? null,
+    };
+  } catch { return {}; }
+}
+
+async function fetchBuoy(stationId: string): Promise<Partial<Conditions>> {
+  try {
+    const url = `https://www.ndbc.noaa.gov/data/realtime2/${stationId}.txt`;
+    const res = await fetch(url);
+    if (!res.ok) return {};
+    const text = await res.text();
+    const lines = text.trim().split("\n");
+    if (lines.length < 3) return {};
+    const headers = lines[0].replace(/^#/, "").trim().split(/\s+/);
+    const values = lines[2].trim().split(/\s+/);
+    const get = (name: string): number | null => {
+      const idx = headers.indexOf(name);
+      if (idx === -1) return null;
+      const val = parseFloat(values[idx]);
+      return isNaN(val) || val === 99 || val === 999 ? null : val;
+    };
+    const wvht = get("WVHT"), dpd = get("DPD"), mwd = get("MWD");
+    const wtmp = get("WTMP"), atmp = get("ATMP");
+    return {
+      swellHeightFt: wvht ? metersToFeet(wvht) : null,
+      swellPeriodS: dpd,
+      swellDirection: mwd ? degreesToCardinal(mwd) : null,
+      waterTempF: wtmp ? celsiusToFahrenheit(wtmp) : null,
+      airTempF: atmp ? celsiusToFahrenheit(atmp) : null,
+    };
+  } catch { return {}; }
+}
+
+async function fetchTides(stationId: string): Promise<Partial<Conditions>> {
+  try {
+    const now = new Date();
+    const begin = formatNOAADate(now);
+    const end = formatNOAADate(new Date(now.getTime() + 24*60*60*1000));
+    const wlUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${begin}&end_date=${end}&station=${stationId}&product=water_level&datum=MLLW&units=english&time_zone=lst_ldt&format=json`;
+    const predUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${begin}&end_date=${end}&station=${stationId}&product=predictions&datum=MLLW&units=english&time_zone=lst_ldt&interval=hilo&format=json`;
+    const [wlRes, predRes] = await Promise.all([fetch(wlUrl), fetch(predUrl)]);
+    const result: Partial<Conditions> = {};
+    if (wlRes.ok) {
+      const d = await wlRes.json();
+      const latest = d.data?.[d.data.length - 1];
+      if (latest?.v) result.tideHeightFt = parseFloat(latest.v);
+    }
+    if (predRes.ok) {
+      const d = await predRes.json();
+      const preds = d.predictions ?? [];
+      const nowMs = now.getTime();
+      for (const p of preds) {
+        const t = new Date(p.t).getTime();
+        if (t > nowMs) {
+          if (p.type === "H" && !result.nextHighTide) result.nextHighTide = p.t;
+          if (p.type === "L" && !result.nextLowTide) result.nextLowTide = p.t;
+        }
+        if (result.nextHighTide && result.nextLowTide) break;
+      }
+      if (result.nextHighTide && result.nextLowTide) {
+        result.tideType = new Date(result.nextHighTide).getTime() < new Date(result.nextLowTide).getTime() ? "rising" : "falling";
+      }
+    }
+    return result;
+  } catch { return {}; }
+}
+
+async function fetchAllConditions(lat: number, lon: number, buoyId?: string, tideStation?: string): Promise<Conditions> {
+  const fetches: Promise<Partial<Conditions>>[] = [fetchMarine(lat, lon), fetchWeather(lat, lon)];
+  if (buoyId) fetches.push(fetchBuoy(buoyId));
+  if (tideStation) fetches.push(fetchTides(tideStation));
+  const results = await Promise.all(fetches);
+  const marine = results[0] ?? {};
+  const weather = results[1] ?? {};
+  const buoy = buoyId ? (results[2] ?? {}) : {};
+  const tides = tideStation ? (results[buoyId ? 3 : 2] ?? {}) : {};
+  return {
+    swellHeightFt: buoy.swellHeightFt ?? marine.swellHeightFt ?? null,
+    swellPeriodS: buoy.swellPeriodS ?? marine.swellPeriodS ?? null,
+    swellDirection: buoy.swellDirection ?? marine.swellDirection ?? null,
+    windSpeedMph: weather.windSpeedMph ?? null,
+    windDirection: weather.windDirection ?? null,
+    windGustsMph: weather.windGustsMph ?? null,
+    tideHeightFt: tides.tideHeightFt ?? null,
+    tideType: tides.tideType ?? null,
+    nextHighTide: tides.nextHighTide ?? null,
+    nextLowTide: tides.nextLowTide ?? null,
+    airTempF: weather.airTempF ?? buoy.airTempF ?? null,
+    waterTempF: buoy.waterTempF ?? null,
+    uvIndex: weather.uvIndex ?? null,
+    sunrise: weather.sunrise ?? null,
+    sunset: weather.sunset ?? null,
+  };
+}
+
+// ========================
+// Spot type display helpers
+// ========================
+
+function spotTypeDisplay(t: string): string {
+  const map: Record<string,string> = { beach_break:"Beach Break", point_break:"Point Break", reef_break:"Reef Break", jetty_break:"Jetty Break" };
+  return map[t] ?? t;
+}
+
+function skillDisplay(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function formatTime(iso: string | null): string {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    const h = d.getHours();
+    const m = String(d.getMinutes()).padStart(2, "0");
+    const ampm = h >= 12 ? "PM" : "AM";
+    const h12 = h % 12 || 12;
+    return `${h12}:${m} ${ampm}`;
+  } catch { return "—"; }
+}
+
+// ========================
+// HTML template
+// ========================
+
+function buildHtml(spot: Record<string, unknown>, cond: Conditions): string {
+  const name = escapeHtml(spot.name as string);
+  const region = escapeHtml(spot.region as string);
+  const county = escapeHtml(spot.county as string);
+  const spotType = spotTypeDisplay(spot.spot_type as string);
+  const desc = spot.description ? escapeHtml(spot.description as string) : null;
+  const skillMin = skillDisplay(spot.skill_level_min as string);
+  const skillMax = skillDisplay(spot.skill_level_max as string);
+  const skillRange = skillMin === skillMax ? skillMin : `${skillMin} – ${skillMax}`;
+  const bestSwell = (spot.best_swell_direction as string[] | null)?.join("/") ?? "Any";
+  const bestSwellSize = spot.best_swell_size_min_ft && spot.best_swell_size_max_ft
+    ? `${spot.best_swell_size_min_ft}–${spot.best_swell_size_max_ft}ft` : "";
+  const bestTide = (spot.best_tide as string) ?? "Any";
+  const bestWind = (spot.best_wind as string) ?? "Any";
+  const bestSeason = (spot.best_season as string) ?? "Year-round";
+
+  // OG description
+  const ogParts: string[] = [];
+  if (cond.swellHeightFt) ogParts.push(`${cond.swellHeightFt}ft @ ${cond.swellPeriodS ?? "?"}s ${cond.swellDirection ?? ""}`);
+  if (cond.windSpeedMph) ogParts.push(`${cond.windSpeedMph}mph ${cond.windDirection ?? ""}`);
+  if (cond.waterTempF) ogParts.push(`${cond.waterTempF}°F water`);
+  const ogDesc = ogParts.length > 0 ? ogParts.join(" · ") : "Live surf conditions";
+
+  const now = new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles", dateStyle: "medium", timeStyle: "short" });
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${name} — Live Surf Report | Neptune</title>
+<meta property="og:title" content="${name} — Live Surf Report">
+<meta property="og:description" content="${escapeHtml(ogDesc)}">
+<meta property="og:type" content="website">
+<meta name="description" content="${escapeHtml(ogDesc)}">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a1628;color:#e8f0fe;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh}
+.header{background:linear-gradient(135deg,#0d2847 0%,#0a1628 50%,#062040 100%);padding:32px 20px 24px;text-align:center;border-bottom:1px solid rgba(59,158,255,0.15)}
+.header h1{font-size:28px;font-weight:700;margin-bottom:4px}
+.header .sub{color:#8899b0;font-size:14px;margin-bottom:10px}
+.badge{display:inline-block;background:rgba(59,158,255,0.15);color:#3b9eff;font-size:12px;font-weight:600;padding:4px 12px;border-radius:20px}
+.container{max-width:600px;margin:0 auto;padding:16px}
+.section-title{font-size:13px;font-weight:600;color:#3b9eff;text-transform:uppercase;letter-spacing:1px;margin:20px 0 10px;padding-left:4px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(min-width:480px){.grid{grid-template-columns:1fr 1fr 1fr}}
+.card{background:#111d2e;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:16px;text-align:center}
+.card .label{font-size:11px;color:#8899b0;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px}
+.card .value{font-size:26px;font-weight:700;line-height:1.1}
+.card .detail{font-size:12px;color:#8899b0;margin-top:4px}
+.card .icon{font-size:20px;margin-bottom:4px}
+.swell .value{color:#3b9eff}
+.wind .value{color:#06b6d4}
+.tide .value{color:#22d3ee}
+.temp .value{color:#f59e0b}
+.info-card{background:#111d2e;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:16px;margin-top:10px}
+.info-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04)}
+.info-row:last-child{border-bottom:none}
+.info-row .k{color:#8899b0;font-size:13px}
+.info-row .val{font-size:13px;font-weight:500}
+.desc{color:#8899b0;font-size:14px;line-height:1.5;margin-top:12px;padding:0 4px}
+.footer{text-align:center;padding:24px 16px 12px;color:#556580;font-size:12px}
+.cta{display:block;margin:24px auto 0;background:linear-gradient(135deg,#3b9eff,#06b6d4);color:#fff;font-size:16px;font-weight:700;padding:16px 32px;border-radius:50px;text-decoration:none;text-align:center;max-width:320px;box-shadow:0 4px 20px rgba(59,158,255,0.3)}
+.cta:hover{opacity:0.9}
+.cta .sub{font-size:12px;font-weight:400;opacity:0.85;display:block;margin-top:2px}
+.sun-row{display:flex;gap:10px;margin-top:10px}
+.sun-row .card{flex:1}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div style="font-size:32px;margin-bottom:8px">🌊</div>
+  <h1>${name}</h1>
+  <div class="sub">${region} · ${county}</div>
+  <span class="badge">${spotType}</span>
+</div>
+
+<div class="container">
+
+  <div class="section-title">Current Conditions</div>
+  <div class="grid">
+    <div class="card swell">
+      <div class="icon">🌊</div>
+      <div class="label">Swell</div>
+      <div class="value">${v(cond.swellHeightFt, "ft")}</div>
+      <div class="detail">${v(cond.swellPeriodS, "s")} ${cond.swellDirection ?? ""}</div>
+    </div>
+    <div class="card wind">
+      <div class="icon">💨</div>
+      <div class="label">Wind</div>
+      <div class="value">${v(cond.windSpeedMph, "mph")}</div>
+      <div class="detail">${cond.windDirection ?? "—"}${cond.windGustsMph ? ` · Gusts ${cond.windGustsMph}mph` : ""}</div>
+    </div>
+    <div class="card tide">
+      <div class="icon">🌙</div>
+      <div class="label">Tide</div>
+      <div class="value">${v(cond.tideHeightFt, "ft")}</div>
+      <div class="detail">${cond.tideType ?? "—"}${cond.nextHighTide ? ` · H ${formatTime(cond.nextHighTide)}` : ""}</div>
+    </div>
+    <div class="card temp">
+      <div class="icon">🌡️</div>
+      <div class="label">Water</div>
+      <div class="value">${v(cond.waterTempF, "°F")}</div>
+      <div class="detail">${cond.waterTempF ? (cond.waterTempF >= 65 ? "Trunks" : cond.waterTempF >= 58 ? "Spring suit" : "Full suit") : ""}</div>
+    </div>
+    <div class="card temp">
+      <div class="icon">☀️</div>
+      <div class="label">Air</div>
+      <div class="value">${v(cond.airTempF, "°F")}</div>
+      <div class="detail">UV ${v(cond.uvIndex)}</div>
+    </div>
+    <div class="card">
+      <div class="icon">🕐</div>
+      <div class="label">Sun</div>
+      <div class="value" style="font-size:16px">${formatTime(cond.sunrise)}</div>
+      <div class="detail">↓ ${formatTime(cond.sunset)}</div>
+    </div>
+  </div>
+
+  <div class="section-title">Best Conditions</div>
+  <div class="info-card">
+    <div class="info-row"><span class="k">Swell</span><span class="val">${bestSwell} ${bestSwellSize}</span></div>
+    <div class="info-row"><span class="k">Tide</span><span class="val">${escapeHtml(bestTide)}</span></div>
+    <div class="info-row"><span class="k">Wind</span><span class="val">${escapeHtml(bestWind)}</span></div>
+    <div class="info-row"><span class="k">Season</span><span class="val">${escapeHtml(bestSeason)}</span></div>
+    <div class="info-row"><span class="k">Skill</span><span class="val">${skillRange}</span></div>
+  </div>
+
+  ${desc ? `<p class="desc">${desc}</p>` : ""}
+
+  <a class="cta" href="#">
+    Get Neptune
+    <span class="sub">AI Surf Coach for iOS</span>
+  </a>
+
+  <div class="footer">
+    Updated ${now} PT<br>
+    Powered by Neptune 🌊
+  </div>
+
+</div>
+</body>
+</html>`;
+}
+
+function notFoundHtml(slug: string): string {
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spot Not Found | Neptune</title>
+<style>body{background:#0a1628;color:#e8f0fe;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center}
+.c{max-width:400px;padding:40px}.e{font-size:48px;margin-bottom:16px}h1{font-size:24px;margin-bottom:8px}p{color:#8899b0;font-size:14px}</style>
+</head><body><div class="c"><div class="e">🏖️</div><h1>Spot Not Found</h1><p>We couldn't find a spot with slug "${escapeHtml(slug)}". Check the URL and try again.</p></div></body></html>`;
+}
+
+// ========================
+// JSON response helpers
+// ========================
+
+function jsonResponse(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=300",
+    },
+  });
+}
+
+// ========================
+// Main handler — returns JSON (Supabase blocks HTML responses)
+// ========================
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", {
+      headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*" },
+    });
+  }
+
+  try {
+    const url = new URL(req.url);
+    const slug = url.searchParams.get("slug");
+
+    if (!slug) {
+      return jsonResponse({ error: "Missing slug parameter" }, 400);
+    }
+
+    // Fetch spot by slug
+    const { data: spot, error } = await supabaseAdmin
+      .from("spots")
+      .select("name, slug, region, county, latitude, longitude, spot_type, spot_type_detail, skill_level_min, skill_level_max, best_swell_direction, best_swell_size_min_ft, best_swell_size_max_ft, best_tide, best_wind, best_season, description, nearest_buoy_id, nearest_tide_station")
+      .eq("slug", slug)
+      .single();
+
+    if (error || !spot) {
+      return jsonResponse({ error: "Spot not found" }, 404);
+    }
+
+    // Fetch live conditions
+    const conditions = await fetchAllConditions(
+      spot.latitude,
+      spot.longitude,
+      spot.nearest_buoy_id ?? undefined,
+      spot.nearest_tide_station ?? undefined,
+    );
+
+    return jsonResponse({
+      spot: {
+        name: spot.name,
+        slug: spot.slug,
+        region: spot.region,
+        county: spot.county,
+        spotType: spotTypeDisplay(spot.spot_type),
+        spotTypeDetail: spot.spot_type_detail,
+        skillLevelMin: skillDisplay(spot.skill_level_min),
+        skillLevelMax: skillDisplay(spot.skill_level_max),
+        bestSwellDirection: spot.best_swell_direction,
+        bestSwellSizeMinFt: spot.best_swell_size_min_ft,
+        bestSwellSizeMaxFt: spot.best_swell_size_max_ft,
+        bestTide: spot.best_tide,
+        bestWind: spot.best_wind,
+        bestSeason: spot.best_season,
+        description: spot.description,
+      },
+      conditions,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("spot-report error:", err);
+    return jsonResponse({ error: "Internal error" }, 500);
+  }
+});
